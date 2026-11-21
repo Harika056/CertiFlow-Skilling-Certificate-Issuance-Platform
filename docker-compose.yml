@@ -1,0 +1,104 @@
+# One command: docker compose up --build
+# UI: http://localhost:8080   API: http://localhost:4000   Mock WhatsApp: http://localhost:4100
+
+x-backend-env: &backend-env
+  DATABASE_URL: postgres://certiflow:certiflow@postgres:5432/certiflow
+  REDIS_URL: redis://redis:6379
+  JWT_SECRET: ${JWT_SECRET:-local-dev-jwt-secret-change-me-0123456789}
+  DOWNLOAD_LINK_SECRET: ${DOWNLOAD_LINK_SECRET:-local-dev-download-secret-change-me-0123}
+  WHATSAPP_URL: http://whatsapp:4100
+  PUBLIC_BASE_URL: http://localhost:8080
+  API_PUBLIC_URL: http://localhost:8080
+  CERT_STORAGE_DIR: /data/certs
+  DEMO_LOGIN_ENABLED: "true"
+  # Demo-friendly SLA: anything waiting > 60 min at one step is escalated.
+  SLA_MINUTES: ${SLA_MINUTES:-60}
+  SLA_SCAN_INTERVAL_MS: "15000"
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: certiflow
+      POSTGRES_PASSWORD: certiflow
+      POSTGRES_DB: certiflow
+    ports: ["5432:5432"]
+    volumes: [pgdata:/var/lib/postgresql/data, ./scripts/init-test-db.sql:/docker-entrypoint-initdb.d/init-test-db.sql:ro]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U certiflow"]
+      interval: 3s
+      retries: 20
+
+  redis:
+    image: redis:7-alpine
+    # AOF persistence: queued jobs survive a Redis restart.
+    command: ["redis-server", "--appendonly", "yes"]
+    ports: ["6379:6379"]
+    volumes: [redisdata:/data]
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 3s
+      retries: 20
+
+  migrate:
+    build: { context: ./backend, target: runtime }
+    environment: *backend-env
+    command: ["sh", "-c", "node dist/db/migrate.js && node dist/db/seed.js"]
+    depends_on:
+      postgres: { condition: service_healthy }
+    restart: "no"
+
+  api:
+    build: { context: ./backend, target: runtime }
+    environment: { <<: *backend-env, SERVICE_NAME: api }
+    ports: ["4000:4000"]
+    volumes: [certs:/data/certs]
+    depends_on:
+      migrate: { condition: service_completed_successfully }
+      redis: { condition: service_healthy }
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:4000/ready"]
+      interval: 5s
+      retries: 20
+    restart: unless-stopped
+
+  worker:
+    build: { context: ./backend, target: runtime }
+    environment: { <<: *backend-env, SERVICE_NAME: worker }
+    command: ["node", "dist/worker.js"]
+    volumes: [certs:/data/certs]
+    depends_on:
+      migrate: { condition: service_completed_successfully }
+      redis: { condition: service_healthy }
+    restart: unless-stopped
+    # Try: docker compose up --scale worker=3
+
+  whatsapp:
+    build: { context: ./backend, target: runtime }
+    environment:
+      PORT: "4100"
+      MOCK_FAIL_RATE: ${MOCK_FAIL_RATE:-0.2}
+      MOCK_TIMEOUT_RATE: ${MOCK_TIMEOUT_RATE:-0.1}
+    command: ["node", "dist/mock-whatsapp/server.js"]
+    ports: ["4100:4100"]
+    restart: unless-stopped
+
+  web:
+    build: ./frontend
+    ports: ["8080:80"]
+    depends_on: [api, whatsapp]
+
+  tests:
+    profiles: ["test"]
+    build: { context: ./backend, target: test }
+    environment:
+      TEST_DATABASE_URL: postgres://certiflow:certiflow@postgres:5432/certiflow_test
+      TEST_REDIS_URL: redis://redis:6379/1
+    depends_on:
+      postgres: { condition: service_healthy }
+      redis: { condition: service_healthy }
+
+volumes:
+  pgdata:
+  redisdata:
+  certs:
